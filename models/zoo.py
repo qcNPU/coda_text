@@ -254,9 +254,10 @@ class ClipZoo(nn.Module):  # ViTZoo本身就是一个model，里面包含预训�
                 q = self.clip.encode_text(q_text)
                 text = [f'a photo of {cname.replace("_", " ")}' for cname in classnames]
                 text = tokenize(text).cuda()  # (10,77)
+                # text = self.clip.encode_text(text)
+                # text = self.clip.token_embedding(text)[:, 0, :]
                 text = text.repeat(x.size(0), 1)
-                # q = self.clip.token_embedding(text)[:, 0, :]
-
+                # q和text使用一个class，把所有class都走一遍，最后得到总体的概率
                 # q, _ = self.feat(x)  # （22,197,768）
                 # q = q[:, 0, :]  # （22,768）
             txt_fea = self.clip.encode_text(text, prompt=self.prompt, q=q, train=train,task_id=self.task_id)#160,768

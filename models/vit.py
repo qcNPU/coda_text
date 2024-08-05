@@ -60,18 +60,18 @@ class Attention(nn.Module):
         return self.attention_map
     
     def forward(self, x, register_hook=False, prompt=None):
-        B, N, C = x.shape #16,197,768
+        B, N, C = x.shape #batch,197,768
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)#16,197,3,12,64->3,16,12,197,64
-        q, k, v = qkv[0], qkv[1], qkv[2] #16,12,197,64  # make torchscript happy (cannot use tensor as tuple)
+        q, k, v = qkv[0], qkv[1], qkv[2] #batch,12,197,64  # make torchscript happy (cannot use tensor as tuple)
 
         if prompt is not None:
             pk, pv = prompt
             pk = pk.reshape(B, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
             pv = pv.reshape(B, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
-            k = torch.cat((pk,k), dim=2)# prefix tunning
+            k = torch.cat((pk,k), dim=2)# prefix tunning # k:batch,12,201,64
             v = torch.cat((pv,v), dim=2)
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = (q @ k.transpose(-2, -1)) * self.scale #attn:batch,12,197,197；q:batch,12,197,64,k:batch,12,201,64
         attn = attn.softmax(dim=-1)#softmax得到权重
         attn = self.attn_drop(attn)
                 
@@ -79,7 +79,7 @@ class Attention(nn.Module):
             self.save_attention_map(attn)
             attn.register_hook(self.save_attn_gradients)        
 
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)#16,197,768
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)#(attn @ v):batch,12,197,64
         x = self.proj(x)
         x = self.proj_drop(x)
         return x

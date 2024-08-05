@@ -100,7 +100,7 @@ class AttentionText(nn.Module):
 
     def forward(self, x, register_hook=False, prompt=None,attn_mask=None,cls_num=10):
 
-        B, N, C = x.shape  # 16,197,768    160,77,768
+        B, N, C = x.shape  # 77,768
         if prompt is None:
             qkv = F.linear(x, self.in_proj_weight, self.in_proj_bias).reshape(B, N, 3, self.num_heads,C // self.num_heads).permute(2, 0, 3, 1,4)  # 16,197,3,12,64->3,16,12,197,64
         else:
@@ -110,12 +110,12 @@ class AttentionText(nn.Module):
 
         if prompt is not None:
             pk, pv = prompt#16,4,768
-            pk = pk.reshape(D, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)#16,12,4,64
+            pk = pk.reshape(D, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)#batch,12,4,64
             pv = pv.reshape(D, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
             k = torch.cat((pk, k), dim=2)  # prefix tunning#16,12,774,64
             v = torch.cat((pv, v), dim=2)
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale#16,12,770,774
+        attn = (q @ k.transpose(-2, -1)) * self.scale#batch,12,770,774  ****每次循环，这句执行完，gpu显存占用增加450MB
         attn = attn.softmax(dim=-1)  # softmax得到权重
         attn = self.attn_drop(attn)
 
@@ -126,6 +126,9 @@ class AttentionText(nn.Module):
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)# 16,770,12,64
         x = self.out_proj(x)
         x = self.proj_drop(x)
+
+        del qkv, q, k, v, attn
+        torch.cuda.empty_cache()  # Clean up cache
         return x
 
 
@@ -134,7 +137,7 @@ class QuickGELU(nn.Module):
         return x * torch.sigmoid(1.702 * x)
 
 
-class ResidualBlock(nn.Module):
+class TextBlock(nn.Module):
     def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None):
         super().__init__()
 
@@ -190,8 +193,11 @@ class Transformer(nn.Module):
         super().__init__()
         self.width = width
         self.layers = layers
+        # self.resblocks = nn.Sequential(*[VisionBlock(width, heads, attn_mask) for _ in range(layers)]) if vision else \
+        #     nn.Sequential(*[ResidualBlock(width, heads, attn_mask) for _ in range(layers)])
+
         self.resblocks = nn.Sequential(*[VisionBlock(width, heads, attn_mask) for _ in range(layers)]) if vision else \
-            nn.Sequential(*[ResidualBlock(width, heads, attn_mask) for _ in range(layers)])
+            nn.Sequential(*[TextBlock(width, heads, attn_mask) for _ in range(layers)])
 
     def forward(self, x: torch.Tensor):
         return self.resblocks(x)
@@ -230,39 +236,6 @@ class VisionTransformer(nn.Module):
 
         if self.proj is not None:
             x = x @ self.proj
-
-        return x
-
-
-class VisionEncoderZS(nn.Module):
-    def __init__(self, cfg, visual):
-        super().__init__()
-
-        self.ln_pre = visual.ln_pre
-        self.transformer = visual.transformer.resblocks
-        self.ln_post = visual.ln_post
-        self.proj = visual.proj
-        self.conv1 = visual.conv1
-        self.class_embedding = visual.class_embedding
-        self.positional_embedding = visual.positional_embedding
-
-    def forward(self, x):
-        x = self.conv1(x)
-        x = x.reshape(x.shape[0], x.shape[1], -1)
-        x = x.permute(0, 2, 1)
-
-        x = torch.cat(
-            [self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device),
-             x], dim=1)
-        x = x + self.positional_embedding.to(x.dtype)
-        x = self.ln_pre(x).type(self.dtype)
-        x = x.permute(1, 0, 2)
-
-        x = self.transformer(x)
-
-        x = x.permute(1, 0, 2)
-        x = self.ln_post(x[:, 0, :])
-        x = x @ self.proj
 
         return x
 
@@ -346,14 +319,12 @@ class CLIP(nn.Module):
         x =  self.token_embedding(text).type(self.dtype)  # [batch_size, n_tpro, d_model]
         x = x + self.positional_embedding.type(self.dtype)
         # x = x.permute(1, 0, 2)  # NLD -> LND
-        # x = x.reshape()
-        prompt_loss = torch.zeros((1,), requires_grad=True).cuda()#loss是这样定义的
+        # prompt_loss = torch.zeros((1,), requires_grad=True).cuda()#loss是这样定义的
         for i,blk in enumerate(self.transformer.resblocks):#对于transformer中每一个block层
-
             if prompt is not None:
                 if train:
                     p_list, loss, x = prompt.forward(q, i, x, train=True)#task_count在prompt内部实现并计数
-                    prompt_loss += loss
+                    # prompt_loss += loss
                 else:
                     p_list, _, x = prompt.forward(q, i, x, train=False)
                 # if p_list is not None and i == 1:
@@ -365,9 +336,7 @@ class CLIP(nn.Module):
                 #     p_list = None
             else:
                 p_list = None
-
-            x = blk(x, register_blk==i, prompt=p_list)#将得到的prompt插入到编码层中，并forward
-
+            x = blk(x, register_blk==i, prompt=p_list)#将匹配出的prompt插入到编码层中，并forward
         # x = self.transformer(x)
         # x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.ln_final(x).type(self.dtype)
@@ -394,6 +363,13 @@ class CLIP(nn.Module):
         # shape = [global_batch_size, global_batch_size]
         return logits_per_image, logits_per_text
 
+
+def  codaForward(prompt,q,i,x,train):
+    return prompt.forward(q, i, x, train=train)
+
+
+def blkForward(blk,x, register, prompt):
+    return blk(x, register, prompt=prompt)
 
 def convert_weights(model: nn.Module):
     """Convert applicable model parameters to fp16"""
@@ -619,7 +595,7 @@ class Text_Transformer(nn.Module):
         self.token_emb = nn.Embedding(vocab_size, transformer_width)
         self.positional_emb = nn.Parameter(torch.empty(context_length, transformer_width))
 
-        self.blocks = nn.Sequential(*[ResidualBlock(transformer_width, num_heads, attn_mask) for _ in range(layers)])
+        self.blocks = nn.Sequential(*[TextBlock(transformer_width, num_heads, attn_mask) for _ in range(layers)])
 
         self.ln_final = LayerNorm(transformer_width)#用的hpt的
 
